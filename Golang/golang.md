@@ -1,23 +1,30 @@
 - [GoLang](#golang)
-  - [GMP模型](#gmp模型)
-    - [用户线程和系统线程的区别](#用户线程和系统线程的区别)
-    - [GMP单独介绍](#gmp单独介绍)
-    - [P和M的数量](#p和m的数量)
-    - [P和M是什么时候被创建的](#p和m是什么时候被创建的)
-    - [调度器的设计策略](#调度器的设计策略)
-    - [调度流程](#调度流程)
-  - [协程交替打印1-20](#协程交替打印1-20)
-    - [使用channel](#使用channel)
-    - [使用锁](#使用锁)
-  - [Golang GC](#golang-gc)
-    - [堆和栈](#堆和栈)
-    - [设计原理](#设计原理)
-      - [标记清除](#标记清除)
-      - [三色抽象](#三色抽象)
-      - [三色抽象的不足](#三色抽象的不足)
-      - [屏障机制](#屏障机制)
-      - [混合写屏障(Go 1.8+)](#混合写屏障go-18)
-  - [Mutex的实现原理](#mutex的实现原理)
+	- [GMP模型](#gmp模型)
+		- [用户线程和系统线程的区别](#用户线程和系统线程的区别)
+		- [GMP单独介绍](#gmp单独介绍)
+		- [P和M的数量](#p和m的数量)
+		- [P和M是什么时候被创建的](#p和m是什么时候被创建的)
+		- [调度器的设计策略](#调度器的设计策略)
+		- [调度流程](#调度流程)
+	- [协程交替打印1-20](#协程交替打印1-20)
+		- [使用channel](#使用channel)
+		- [使用锁](#使用锁)
+	- [Golang GC](#golang-gc)
+		- [堆和栈](#堆和栈)
+		- [设计原理](#设计原理)
+			- [标记清除](#标记清除)
+			- [三色抽象](#三色抽象)
+				- [不足](#不足)
+			- [屏障机制](#屏障机制)
+				- [混合写屏障(Go 1.8+)](#混合写屏障go-18)
+	- [Mutex的实现原理](#mutex的实现原理)
+		- [正常模式和饥饿模式](#正常模式和饥饿模式)
+		- [互斥锁的状态(state)](#互斥锁的状态state)
+		- [Lock()](#lock)
+			- [判断当前Goroutine能否进入自旋](#判断当前goroutine能否进入自旋)
+			- [通过自旋等待互斥锁的释放](#通过自旋等待互斥锁的释放)
+			- [计算互斥锁的最新状态](#计算互斥锁的最新状态)
+			- [更新互斥锁的状态并获取锁](#更新互斥锁的状态并获取锁)
 
 # GoLang
 
@@ -224,7 +231,7 @@ func main() {
 
 ![](2020-03-16-15843705141828-tri-color-mark-sweep-and-mutator.png)
 
-#### 三色抽象的不足
+##### 不足
 
 普通的三色抽象机制是需要STW的，否在在同时满足以下条件时三色抽象机制会错误的把不该回收的对象回收：
 
@@ -246,7 +253,7 @@ func main() {
 
 删除屏障是指如果被删除的对象自身为白色，那么被标记为灰色。这样做满足弱三色不变式。这种方式不区分栈和堆，而且一个对象即使被删除了最后一个指向它的指针也依旧可以活过这一轮，在下一轮GC中被清理掉。
 
-#### 混合写屏障(Go 1.8+)
+##### 混合写屏障(Go 1.8+)
 
 目前屏障机制的问题是：
 
@@ -261,3 +268,115 @@ func main() {
 - 被添加的对象标记为灰色。
 
 ## Mutex的实现原理
+
+> 看这部分知识前，需要先理解锁的相关知识，详见[Lock](../Lock/lock.md)。
+> 
+> Refs: 
+> - [同步原语与锁](https://draveness.me/golang/docs/part3-runtime/ch06-concurrency/golang-sync-primitives/)
+> - [sync.Mutex互斥锁的实现原理](https://segmentfault.com/a/1190000023874384)
+> - [golang中的Mutex设计原理详解（一）](https://zhuanlan.zhihu.com/p/339981535)
+> - [Go 中的 Mutex 设计原理详解（二）](https://zhuanlan.zhihu.com/p/341887600)
+> - [Go 中的 Mutex 设计原理详解（三）](https://zhuanlan.zhihu.com/p/342706674)
+> - [Go 中的 Mutex 设计原理详解（四）](https://zhuanlan.zhihu.com/p/344977623)
+
+Go的Mutex结构体构成如下，其中state标志互斥锁的状态，sema标志信号量。
+
+```go
+type Mutex struct {
+	state int32
+	sema  uint32
+}
+```
+
+### 正常模式和饥饿模式
+
+在正常模式下，锁的等待者会按照先进先出的顺序获取锁。如果有Goroutine在1ms以内没有竞争到锁后，则从正常模式切换为饥饿模式，防止部分Goroutine被“饿死”。
+
+### 互斥锁的状态(state)
+
+![](2020-01-23-15797104328010-golang-mutex-state.png)
+
+在默认情况下，互斥锁的所有状态位都是 0，int32中的不同位分别表示了不同的状态：
+
+- mutexLocked：表示互斥锁的锁定状态；
+- mutexWoken：表示从正常模式被从唤醒；
+- mutexStarving：当前的互斥锁进入饥饿状态；
+- waitersCount：当前互斥锁上等待的Goroutine个数；
+
+### Lock()
+
+Mutex的Lock()方法如下，首先尝试获取state的`mutexLocked`状态，如果为0则表明获到取锁并返回。如果获取不到锁，则执行`m.lockSlow()`方法，进入自旋锁。
+
+互斥锁的加锁过程比较复杂，它涉及自旋、信号量以及调度等概念：
+
+- 如果互斥锁处于初始化状态，会通过置位 mutexLocked 加锁；
+- 如果互斥锁处于 mutexLocked 状态并且在普通模式下工作，会进入自旋，执行 30 次 PAUSE 指令消耗 CPU 时间等待锁的释放；
+- 如果当前 Goroutine 等待锁的时间超过了 1ms，互斥锁就会切换到饥饿模式；
+- 互斥锁在正常情况下会通过 runtime.sync_runtime_SemacquireMutex 将尝试获取锁的 Goroutine 切换至休眠状态，等待锁的持有者唤醒；
+- 如果当前 Goroutine 是互斥锁上的最后一个等待的协程或者等待的时间小于 1ms，那么它会将互斥锁切换回正常模式；
+
+互斥锁的解锁过程与之相比就比较简单，其代码行数不多、逻辑清晰，也比较容易理解：
+
+- 当互斥锁已经被解锁时，调用 sync.Mutex.Unlock 会直接抛出异常；
+- 当互斥锁处于饥饿模式时，将锁的所有权交给队列中的下一个等待者，等待者会负责设置 mutexLocked 标志位；
+- 当互斥锁处于普通模式时，如果没有 Goroutine 等待锁的释放或者已经有被唤醒的 Goroutine 获得了锁，会直接返回；在其他情况下会通过 sync.runtime_Semrelease 唤醒对应的 Goroutine；
+
+```go
+func (m *Mutex) Lock() {
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		return
+	}
+	m.lockSlow()
+}
+```
+
+对于lockSlow()方法，主要包含四个部分：
+
+- 判断当前Goroutine能否进入自旋；
+- 通过自旋等待互斥锁的释放；
+- 计算互斥锁的最新状态；
+- 更新互斥锁的状态并获取锁。
+
+#### 判断当前Goroutine能否进入自旋
+
+如果自旋锁进入的时机不好，会非常影响整体的运行速度，因此自旋锁进入的条件非常苛刻：
+
+- 互斥锁只有在普通模式才能进入自旋；
+- `runtime.sync_runtime_canSpin`需要返回true：
+  - 运行在多CPU的机器上；(自旋锁会不断占用CPU)
+  - 当前Goroutine为了获取该锁进入自旋的次数小于四次；
+  - 当前机器上至少存在一个正在运行的处理器P并且处理的运行队列为空；
+
+#### 通过自旋等待互斥锁的释放
+
+一旦当前Goroutine能够进入自旋就会调用`runtime.sync_runtime_doSpin`和`runtime.procyield`并执行30次的PAUSE指令，该指令只会占用CPU并消耗CPU时间。
+
+#### 计算互斥锁的最新状态
+
+略。
+
+```go
+// 将旧状态赋值给新状态
+new := old
+// 现在和原来都不是饥饿模式
+if old & mutexStarving == 0 {
+	// 新状态为锁定状态，如果old是锁定状态或者mutexLocked是锁定状态
+	// 新状态为不锁定状态，如果old和mutexLocked同时为不锁定状态
+	new |= mutexLocked
+}
+// (mutexLocked | mutexStarving) = 0，如果既是不锁定状态且正常模式
+// old & (mutexLocked | mutexStarving) != 0，
+if old & (mutexLocked | mutexStarving) != 0 {
+	new += 1 << mutexWaiterShift
+}
+if starving && old&mutexLocked != 0 {
+	 |= mutexStarving
+}
+if awoke {
+	new &^= mutexWoken
+}
+```
+
+#### 更新互斥锁的状态并获取锁
+
+计算了新的互斥锁状态之后，会使用CAS函数`sync/atomic.CompareAndSwapInt32`更新状态。

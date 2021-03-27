@@ -16,8 +16,11 @@
 			- [三色抽象](#三色抽象)
 				- [不足](#不足)
 			- [屏障机制](#屏障机制)
-				- [混合写屏障(Go 1.8+)](#混合写屏障go-18)
+			- [混合写屏障(Go 1.8+)](#混合写屏障go-18)
 	- [Mutex的实现原理](#mutex的实现原理)
+		- [信号量](#信号量)
+		- [V1](#v1)
+		- [V2](#v2)
 		- [正常模式和饥饿模式](#正常模式和饥饿模式)
 		- [互斥锁的状态(state)](#互斥锁的状态state)
 		- [Lock()](#lock)
@@ -25,6 +28,7 @@
 			- [通过自旋等待互斥锁的释放](#通过自旋等待互斥锁的释放)
 			- [计算互斥锁的最新状态](#计算互斥锁的最新状态)
 			- [更新互斥锁的状态并获取锁](#更新互斥锁的状态并获取锁)
+	- [Channel机制](#channel机制)
 
 # GoLang
 
@@ -183,6 +187,11 @@ func main() {
 > - [垃圾收集器](https://draveness.me/golang/docs/part3-runtime/ch07-memory/golang-garbage-collector/)
 > - [C/C++的内存分配？栈和堆的区别？为什么栈快？](https://blog.csdn.net/baidu_37964071/article/details/81428139)
 > - [Golang三色标记、混合写屏障GC模式图文全分析](https://segmentfault.com/a/1190000022030353)
+> - [golang 垃圾回收（一）概述](https://liqingqiya.github.io/golang/gc/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/2020/06/02/gc1.html)
+> - [golang 垃圾回收（二）屏障技术](https://liqingqiya.github.io/golang/gc/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/2020/06/02/gc2.html)
+> - [golang 垃圾回收（三）插入写屏障](https://liqingqiya.github.io/golang/gc/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/2020/06/03/gc3.html)
+> - [golang 垃圾回收（四）删除写屏障](https://liqingqiya.github.io/golang/gc/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/2020/06/13/gc4.html)
+> - [golang 垃圾回收（五）混合写屏障](https://liqingqiya.github.io/golang/gc/%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/%E5%86%99%E5%B1%8F%E9%9A%9C/2020/07/24/gc5.html)
 
 ### 堆和栈
 
@@ -249,11 +258,11 @@ func main() {
 
 强三色不变式避免了白色被挂在黑色下，而弱三色不变式保证所有的白色节点还有被扫描到的可能性。
 
-插入屏障是指**在A对象引用B对象的时候，会将B对象标记为灰色**，即满足了强三色不变式。但是插入屏障仅仅会作用于栈空间，不会作用于堆空间，因为要保证栈的运行效率。在每一阶段的结束后需要一个STW来重新扫描堆空间中的元素。
+插入写屏障是指**在A对象引用B对象的时候，会将B对象标记为灰色**，即满足了强三色不变式。但是插入屏障仅仅会作用于堆空间，不会作用于栈空间，因为要保证栈的运行效率。在每一阶段的结束后需要一个STW来重新扫描堆空间中的元素。
 
-删除屏障是指如果被删除的对象自身为白色，那么被标记为灰色。这样做满足弱三色不变式。这种方式不区分栈和堆，而且一个对象即使被删除了最后一个指向它的指针也依旧可以活过这一轮，在下一轮GC中被清理掉。
+删除写屏障是指如果被删除的对象自身为白色，那么被标记为灰色。这样做满足弱三色不变式。这种方式不区分栈和堆，而且一个对象即使被删除了最后一个指向它的指针也依旧可以活过这一轮，在下一轮GC中被清理掉。
 
-##### 混合写屏障(Go 1.8+)
+#### 混合写屏障(Go 1.8+)
 
 目前屏障机制的问题是：
 
@@ -278,8 +287,121 @@ func main() {
 > - [Go 中的 Mutex 设计原理详解（二）](https://zhuanlan.zhihu.com/p/341887600)
 > - [Go 中的 Mutex 设计原理详解（三）](https://zhuanlan.zhihu.com/p/342706674)
 > - [Go 中的 Mutex 设计原理详解（四）](https://zhuanlan.zhihu.com/p/344977623)
+> - [操作系统之信号量](https://blog.csdn.net/qq_19782019/article/details/79746627)
 
-Go的Mutex结构体构成如下，其中state标志互斥锁的状态，sema标志信号量。
+Go的Mutex结构体构成如下，其中state标志互斥锁的状态，sema标志信号量。以下是Mutex的四个演进过程。
+
+![](v2-703714b63978a92633346f118325242e_1440w.jpeg)
+
+### 信号量
+
+在OS中有P和V操作，P操作是将信号量-1，V操作是将信号量+1，所以信号量的运作方式为：
+
+- 初始化，给与它一个非负数的整数值。
+- 程序企图进入临界区块的进程，需要先运行P。
+  - 当信号量S减为负值时，进程会被挡住，不能继续，这时该进程被阻塞；
+  - 当信号量S不为负值时，进程可以获准进入临界区块。
+- 结束离开临界区块的进程，将会运行V。当信号量S不为负值时，先前被挡住的其他进程，将可获准进入临界区块。
+
+### V1
+
+整体代码为
+
+```go
+// CAS操作，当时还没有抽象出atomic包
+    func cas(val *int32, old, new int32) bool
+    func semacquire(*int32)
+    func semrelease(*int32)
+    // 互斥锁的结构，包含两个字段
+    type Mutex struct {
+        key  int32 // 锁是否被持有的标识
+        sema int32 // 信号量专用，用以阻塞/唤醒goroutine
+    }
+    
+    // 保证成功在val上增加delta的值
+    func xadd(val *int32, delta int32) (new int32) {
+        for {
+            v := *val
+            if cas(val, v, v+delta) {
+                return v + delta
+            }
+        }
+        panic("unreached")
+    }
+    
+    // 请求锁
+    func (m *Mutex) Lock() {
+        if xadd(&m.key, 1) == 1 { //标识加1，如果等于1，成功获取到锁
+            return
+        }
+        semacquire(&m.sema) // 否则阻塞等待
+    }
+    
+    func (m *Mutex) Unlock() {
+        if xadd(&m.key, -1) == 0 { // 将标识减去1，如果等于0，则没有其它等待者
+            return
+        }
+        semrelease(&m.sema) // 唤醒其它阻塞的goroutine
+    }
+```
+
+加锁过程本质上是给Mutex.key加1（Mutex.key == 0说明目前没有上锁），所以如果`xadd(&m.key, 1) == 1`说明原先没有上锁，当前进程拿到了锁，如果返回`xadd(&m.key, 1) > 1`，则说明已经上锁，需要调用`semacquire(&m.sema)`使得Goroutine进入等待队列并变为阻塞状态。
+
+解锁操作是加锁操作的逆运算，本质上是对Mutex.key减1，如果`xadd(&m.key, -1) >= 1`，则说明当前有等待者，所以需要利用信号量`semrelease(&m.sema)`唤醒被阻塞的Goroutine，如果`xadd(&m.key, -1) == 0`，则说明当前锁已经无人竞争，意味着该Mutex锁已经解锁。
+
+第一版的弊端是Unlock调用无限制以及Goroutine唤醒效率低下的问题：
+
+Unlock调用无限制这个问题主要是讲的是加锁过程和解锁过程不携带Goroutine信息，也就是说Gorotine A获取的锁，可以被Goroutine B来解锁。即使到第四版，Mutex依然有这个问题，所以要遵循“谁加锁，谁解锁”的设计原则。
+
+Goroutine唤醒效率低下的问题是因为在阻塞队列中唤醒是按照顺序的，但是往往队列中靠前的任务是不占用CPU，因此唤醒这些Goroutine需要进行上下文切换，造成性能浪费。改进方式也非常简单，即让新人（占用CPU的Goroutine）一些机会。
+
+### V2
+
+```go
+// A Mutex is a mutual exclusion lock.
+// Mutexes can be created as part of other structures;
+// the zero value for a Mutex is an unlocked mutex.
+type Mutex struct {
+    state int32
+    sema  uint32
+}
+
+// init values are:
+// 	mutexLocked = 1 << 0 == 1 == 0x0001
+// 	mutexWoken = 1 << 1 == 2 == 0x0010
+// 	mutexWaiterShift == 2
+const (
+    mutexLocked = 1 << iota // mutex is locked
+    mutexWoken
+    mutexWaiterShift = iota
+)
+```
+
+把原先的计数器key改为state，并在不同的位表示不同的含义。
+
+![](v2-775e45bc1edd7bfab3a6f3457fe9ffab_1440w.jpeg)
+
+相比于原来的key字段，多了一个唤醒标志位，同时把是否持有锁以及等待锁的goroutine数量这两个表示进行了一个区分。
+
+```go
+func (m *Mutex) Lock() {
+	// Fast path: grab the unlocked mutex
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		return
+	}
+
+	awoke := false
+	for {
+		old := m.state
+		// new == 0x???1 -> 表明锁的状态为已上锁
+		new := old | mutexLocked
+		// old
+		if old & mutexLocked != 0 {
+			
+		}
+	}
+}
+```
 
 ```go
 type Mutex struct {
@@ -380,3 +502,7 @@ if awoke {
 #### 更新互斥锁的状态并获取锁
 
 计算了新的互斥锁状态之后，会使用CAS函数`sync/atomic.CompareAndSwapInt32`更新状态。
+
+## Channel机制
+
+> Ref: [Go channel 实现原理分析](https://www.jianshu.com/p/d841f251d3bc)

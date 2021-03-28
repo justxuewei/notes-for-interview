@@ -24,6 +24,7 @@
 		- [V3](#v3)
 		- [V4](#v4)
 	- [Channel机制](#channel机制)
+		- [hchan](#hchan)
 
 # GoLang
 
@@ -699,4 +700,84 @@ func (m *Mutex) unlockSlow(new int32) {
 
 ## Channel机制
 
-> Ref: [Go channel 实现原理分析](https://www.jianshu.com/p/d841f251d3bc)
+> Ref: [Go channel 实现原理分析](https://segmentfault.com/a/1190000019172554)
+
+### hchan
+
+通道的结构数据为hchan，下面是它的具体结构。
+
+```go
+type hchan struct {
+	qcount uint // 队列中数据的数量
+	dataqsiz uint // 循环队列的长度
+	buf unsafe.Pointer // 指向循环队列元素的指针
+	elemsize uint16 // 每个元素的大小
+	closed uint32 // 表示当前通道是否处于关闭状态。该字段设置为0->通道打开; 通过调用close将其置为1->通道关闭。
+	elemtype *_type // 元素类型
+	sendx uint // 发送索引
+	recvx uint // 接收索引
+	recvq waitq // 接收等待者链表
+	sendq waitq // 发送等待者链表
+
+	lock mutex // 保护hchan中的所有字段
+}
+
+type waitq struct {
+	// sudog代表一个goroutine
+	first *sudog
+	last *sudog
+}
+```
+
+带缓冲的channel的创建方式是`ch := make(chan int, 3)`，在断点调试下可以观察内部结构为:
+
+```
+hchan struct {
+    qcount uint : 0 
+    dataqsiz uint : 3 
+    buf unsafe.Pointer : 0xc00007e0e0 
+    elemsize uint16 : 8 
+    closed uint32 : 0 
+    elemtype *runtime._type : &{
+        size:8 
+        ptrdata:0 
+        hash:4149441018 
+        tflag:7 
+        align:8 
+        fieldalign:8 
+        kind:130 
+        alg:0x55cdf0 
+        gcdata:0x4d61b4 
+        str:1055 
+        ptrToThis:45152
+        }
+    sendx uint : 0 
+    recvx uint : 0 
+    recvq runtime.waitq : 
+        {first:<nil> last:<nil>}
+    sendq runtime.waitq : 
+        {first:<nil> last:<nil>}
+    lock runtime.mutex : 
+        {key:0}
+}
+```
+
+![](1012123951-5cda294a2b0fe_fix732.png)
+
+执行`ch <- 3`发生的事情包括：
+
+1. 获取mutex锁；
+2. 确定写入。尝试recvq从等待队列中获取等待goroutine，然后将元素直接写入goroutine；
+3. 如果recvq为Empty，则确定缓冲区是否可用。如果可用，从当前goroutine复制数据到缓冲区；
+4. 如果缓冲区已满，则要写入的元素将保存在当前正在执行的goroutine的结构中，并且当前goroutine将在sendq中排队并从运行时挂起；
+5. 写入完成释放锁；
+
+执行`val := <- ch`读操作执行的过程：
+
+1. 获取mutex锁；
+2. 尝试sendq从等待队列中获取等待的goroutine；
+   - 如有等待的goroutine，没有缓冲区，取出goroutine并读取数据，然后唤醒这个goroutine，结束读取释放锁；
+   - 如有等待的goroutine，且有缓冲区（此时缓冲区已满），从缓冲区队首取出数据，再从sendq取出一个goroutine，将goroutine中的数据存入buf队尾，结束读取释放锁；
+   - 如没有等待的goroutine，且缓冲区有数据，直接读取缓冲区数据，结束读取释放锁；
+   - 如没有等待的goroutine，且没有缓冲区或缓冲区为空，将当前的goroutine加入recvq排队，进入睡眠，等待被写goroutine唤醒。
+3. 结束读取释放锁。

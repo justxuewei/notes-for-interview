@@ -1,30 +1,44 @@
 - [GoLang](#golang)
-	- [GMP模型](#gmp模型)
-		- [用户线程和系统线程的区别](#用户线程和系统线程的区别)
-		- [GMP单独介绍](#gmp单独介绍)
-		- [P和M的数量](#p和m的数量)
-		- [P和M是什么时候被创建的](#p和m是什么时候被创建的)
-		- [调度器的设计策略](#调度器的设计策略)
-		- [调度流程](#调度流程)
-	- [协程交替打印1-20](#协程交替打印1-20)
-		- [使用channel](#使用channel)
-		- [使用锁](#使用锁)
-	- [Golang GC](#golang-gc)
-		- [堆和栈](#堆和栈)
-		- [设计原理](#设计原理)
-			- [标记清除](#标记清除)
-			- [三色抽象](#三色抽象)
-				- [不足](#不足)
-			- [屏障机制](#屏障机制)
-			- [混合写屏障(Go 1.8+)](#混合写屏障go-18)
-	- [Mutex的实现原理](#mutex的实现原理)
-		- [信号量](#信号量)
-		- [V1](#v1)
-		- [V2](#v2)
-		- [V3](#v3)
-		- [V4](#v4)
-	- [Channel机制](#channel机制)
-		- [hchan](#hchan)
+  - [GMP模型](#gmp模型)
+    - [用户线程和系统线程的区别](#用户线程和系统线程的区别)
+    - [GMP单独介绍](#gmp单独介绍)
+    - [P和M的数量](#p和m的数量)
+    - [P和M是什么时候被创建的](#p和m是什么时候被创建的)
+    - [调度器的设计策略](#调度器的设计策略)
+    - [调度流程](#调度流程)
+  - [协程交替打印1-20](#协程交替打印1-20)
+    - [使用channel](#使用channel)
+    - [使用锁](#使用锁)
+  - [Golang GC](#golang-gc)
+    - [堆和栈](#堆和栈)
+    - [设计原理](#设计原理)
+      - [标记清除](#标记清除)
+      - [三色抽象](#三色抽象)
+        - [不足](#不足)
+      - [屏障机制](#屏障机制)
+      - [混合写屏障(Go 1.8+)](#混合写屏障go-18)
+  - [Mutex的实现原理](#mutex的实现原理)
+    - [信号量](#信号量)
+    - [V1](#v1)
+    - [V2](#v2)
+    - [V3](#v3)
+    - [V4](#v4)
+  - [Channel机制](#channel机制)
+    - [hchan](#hchan)
+  - [Slice](#slice)
+    - [初始化](#初始化)
+      - [下标](#下标)
+      - [字面量](#字面量)
+      - [make()函数](#make函数)
+    - [扩容机制](#扩容机制)
+  - [Map](#map)
+    - [Hmap结构](#hmap结构)
+    - [初始化](#初始化-1)
+      - [字面量初始化](#字面量初始化)
+      - [运行时](#运行时)
+      - [runtime.makemap](#runtimemakemap)
+    - [读写操作](#读写操作)
+      - [访问](#访问)
 
 # GoLang
 
@@ -254,7 +268,7 @@ func main() {
 
 强三色不变式避免了白色被挂在黑色下，而弱三色不变式保证所有的白色节点还有被扫描到的可能性。
 
-插入写屏障是指**在A对象引用B对象的时候，会将B对象标记为灰色**，即满足了强三色不变式。但是插入屏障仅仅会作用于堆空间，不会作用于栈空间，因为要保证栈的运行效率。在每一阶段的结束后需要一个STW来重新扫描堆空间中的元素。
+插入写屏障是指**在A对象引用B对象的时候，会将B对象标记为灰色**，即满足了强三色不变式。但是插入屏障仅仅会作用于堆空间，不会作用于栈空间，因为要保证栈的运行效率。在每一阶段的结束后需要一个STW来重新扫描栈空间中的元素。
 
 删除写屏障是指如果被删除的对象自身为白色，那么被标记为灰色。这样做满足弱三色不变式。这种方式不区分栈和堆，而且一个对象即使被删除了最后一个指向它的指针也依旧可以活过这一轮，在下一轮GC中被清理掉。
 
@@ -781,3 +795,307 @@ hchan struct {
    - 如没有等待的goroutine，且缓冲区有数据，直接读取缓冲区数据，结束读取释放锁；
    - 如没有等待的goroutine，且没有缓冲区或缓冲区为空，将当前的goroutine加入recvq排队，进入睡眠，等待被写goroutine唤醒。
 3. 结束读取释放锁。
+
+## Slice
+
+> Refs: 
+> - [Go slice扩容深度分析](https://juejin.cn/post/6844903812331732999)
+> - [切片](https://draveness.me/golang/docs/part2-foundation/ch03-datastructure/golang-array-and-slice/)
+
+### 初始化
+
+主要包含三种初始化方案
+
+```go
+// 通过下标创建切片
+arr[0:3] // 对数组使用下标
+slice[0:3] // 对切片使用下标
+
+// 使用字面量
+slice := []int{1, 2, 3}
+
+// 使用make()函数创建
+slice := make([]int, 2)
+```
+
+#### 下标
+
+这种方法是最接近底层的一种方法，编译器会将语句转化为`OpSliceMake`方法，该方法会接受四个参数创建新的切片：元素类型、数组指针、切片大小和容量。
+
+#### 字面量
+
+对于字面量的创建方式，以`[]int{1, 2, 3}`为例，在编译期间会将它展开为如下所示的代码。
+
+```go
+var vstat [3]int // 推测数组大小并创建一个数据
+// 赋值字面量
+vstat[0] = 1
+vstat[1] = 2
+vstat[2] = 3
+var vauto *[3]int = new([3]int) // 创建一个同样指向[3]int类型的数组指针
+*vauto = vstat // 将真实数组地址赋值给vauto
+slice := vauto[:] // 通过[:]操作获取一个底层使用vauto的切片
+```
+
+#### make()函数
+
+如果使用字面量的方式创建切片，大部分的工作都会在**编译期间**完成。
+
+在runtime中，首先做参数检查，即len和cap的关系，然后检查数据是否会发生逃逸以及尺寸的大小，如果发生逃逸或者数据尺寸大，则将切片建立在堆上，反正则建立在栈内。
+
+比如`make([]int, 3, 4)`，在不发生逃逸的前提下（它的大小足够小），则会被编译器转化为：
+
+```go
+var arr [4]int
+n := arr[:3] // 底层调用的是OpSliceMake方法
+```
+
+如果需要在堆中创建，则最终会调用`runtime.makeslice`方法。
+
+```go
+func makeslice(et *_type, len, cap int) unsafe.Pointer {
+    // 内存大小 = 元素大小 * cap
+	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
+    // 溢出 || 申请的内存大于最大可分配的内存 || 传入的长度小于0 || 长度大于容量
+	if overflow || mem > maxAlloc || len < 0 || len > cap {
+        // 尝试长度为len
+		mem, overflow := math.MulUintptr(et.size, uintptr(len))
+		if overflow || mem > maxAlloc || len < 0 {
+			panicmakeslicelen()
+		}
+		panicmakeslicecap()
+	}
+    // runtime.makeslice 在最后调用的 runtime.mallocgc 是用于申请内存的函数，这个函数的实现还是比较复杂，如果遇到了比较小的对象会直接初始化在 Go 语言调度器里面的 P 结构中，而大于 32KB 的对象会在堆上初始化，我们会在后面的章节中详细介绍 Go 语言的内存分配器，这里就不展开分析了。
+	return mallocgc(mem, et, true)
+}
+```
+
+### 扩容机制
+
+append单个元素，或者append少量的多个元素，这里的少量指double之后的容量能容纳，这样就会走以下扩容流程，不足1024，双倍扩容，超过1024的，1.25倍扩容。若是append多个元素，且double后的容量不能容纳，直接使用预估的容量。
+
+此外，以上两个分支得到新容量后，均需要根据slice的类型size，算出新的容量所需的内存情况capmem，然后再进行capmem向上取整，得到新的所需内存，除上类型size，得到真正的最终容量,作为新的slice的容量。
+
+## Map
+
+> Refs: 
+> - [深入理解 Go map：初始化和访问元素](https://segmentfault.com/a/1190000018387055)
+> - [深入理解 Go map：赋值和扩容迁移](https://segmentfault.com/a/1190000018632347)
+> - [深度解密Go语言之 map](https://zhuanlan.zhihu.com/p/66676224)
+> - [map的实现](https://tiancaiamao.gitbooks.io/go-internals/content/zh/02.3.html)
+
+### Hmap结构
+
+![](hmap-and-buckets.png)
+
+```go
+type hmap struct {
+    count int // map的大小
+    flags uint8 // 状态标识，用于并发读写的判断条件
+    B uint8 // 桶，最大可容纳的元素数量，值为负载因子(默认 6.5)*2^B
+    noverflow uint16 // 溢出桶的数量
+    hash0 uint32 // 哈希因子
+    buckets unsafe.Pointer // 保存当前桶数据的指针地址
+    oldbuckets unsafe.Pointer // 保存旧桶的指针地址
+    nevacuate uintptr // 迁移进度
+    extra *mapextra
+}
+
+type mapextra struct {
+    overflow *[]*bmap // （当前）溢出桶的指针地址
+    oldoverflow *[]*bmap // （旧）溢出桶的指针地址
+    nextOverflow *bmap // 为空闲溢出桶的指针地址
+}
+
+type bmap struct {
+    tophash [bucketCnt]uint8
+}
+```
+
+哈希表的桶的数据结构是`runtime.bmap`，每一个bmap可以存储8个kv对。虽然在定义中bmap只含有一个tophash字段，但是在runtime中bmap的数据结构表示如下，造成这种差异的原因是Go语言不支持泛型，所以键值对占据的内存空间大小只能在编译时进行推导。
+
+```go
+type bmap struct {
+    topbits  [8]uint8
+    keys     [8]keytype
+    values   [8]valuetype
+    pad      uintptr
+    overflow uintptr
+}
+```
+
+### 初始化
+
+#### 字面量初始化
+
+```go
+hash := map[string]int{
+	"1": 2,
+	"3": 4,
+	"5": 6,
+}
+```
+
+当哈希表中的元素数量少于或者等于 25 个时，编译器会将字面量初始化的结构体转换成以下的代码，将所有的键值对一次加入到哈希表中：
+
+```go
+hash := make(map[string]int, 3)
+hash["1"] = 2
+hash["3"] = 4
+hash["5"] = 6
+```
+
+一旦哈希表中元素的数量超过了 25 个，编译器会创建两个数组分别存储键和值，这些键值对会通过如下所示的 for 循环加入哈希：
+
+```go
+hash := make(map[string]int, 26)
+vstatk := []string{"1", "2", "3", ... ， "26"}
+vstatv := []int{1, 2, 3, ... , 26}
+for i := 0; i < len(vstak); i++ {
+    hash[vstatk[i]] = vstatv[i]
+}
+```
+
+#### 运行时
+
+当创建的哈希被分配到栈上并且其容量小于8(BUCKETSIZE)，Go 语言在编译阶段会使用如下方式快速初始化哈希，这也是编译器对小容量的哈希做的优化：
+
+```go
+var h *hmap
+var hv hmap
+var bv bmap
+h := &hv
+b := &bv
+h.buckets = b
+h.hash0 = fashtrand0()
+```
+
+#### runtime.makemap
+
+除了上述特定的优化之外，无论 make 是从哪里来的，只要我们使用 make 创建哈希，Go 语言编译器都会在类型检查期间将它们转换成 runtime.makemap，使用字面量初始化哈希也只是语言提供的辅助工具，最后调用的都是 runtime.makemap。
+
+```go
+func makemap(t *maptype, hint int, h *hmap) *hmap {
+    // 内存大小 = hint * 桶的数量
+	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)
+    // 溢出 || 内存空间大于堆的最大空间
+	if overflow || mem > maxAlloc {
+		hint = 0
+	}
+
+    // 如果h是空，则初始化一个hmap并将指针赋值给h
+	if h == nil {
+		h = new(hmap)
+	}
+    // 获取一个随机的哈希种子
+	h.hash0 = fastrand()
+
+    // 根据传入的 hint 计算出需要的最小需要的桶的数量
+	B := uint8(0)
+	for overLoadFactor(hint, B) {
+		B++
+	}
+	h.B = B
+
+	if h.B != 0 {
+		var nextOverflow *bmap
+        // 创建用于保存桶的数组，详见下面
+		h.buckets, nextOverflow = makeBucketArray(t, h.B, nil)
+		if nextOverflow != nil {
+			h.extra = new(mapextra)
+			h.extra.nextOverflow = nextOverflow
+		}
+	}
+	return h
+}
+
+func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets unsafe.Pointer, nextOverflow *bmap) {
+	base := bucketShift(b)
+	nbuckets := base
+
+    // b大于等于4时，额外创建2**(b-4)个桶
+	if b >= 4 {
+		nbuckets += bucketShift(b - 4)
+		sz := t.bucket.size * nbuckets
+		up := roundupsize(sz)
+		if up != sz {
+			nbuckets = up / t.bucket.size
+		}
+	}
+
+    // 创建数组
+	buckets = newarray(t.bucket, int(nbuckets))
+    // 如果额外创建了多余的桶
+	if base != nbuckets {
+        // 指向溢出桶的指针
+		nextOverflow = (*bmap)(add(buckets, base*uintptr(t.bucketsize)))
+        // 指向数组最后元素的指针
+		last := (*bmap)(add(buckets, (nbuckets-1)*uintptr(t.bucketsize)))
+		last.setoverflow(t, (*bmap)(buckets))
+	}
+	return buckets, nextOverflow
+}
+```
+
+### 读写操作
+
+读操作主要包含两种情况
+
+```go
+example := make(map[int]int, 100)
+
+// 遍历形式
+for k, v := range example {
+    fmt.Println(k, v)
+}
+
+// 下标形式
+example[100]
+```
+
+修改和赋值操作都是一样的，即统一使用赋值操作，还有一个是删除操作，如下所示。
+
+```go
+delete(example, 100)
+```
+
+#### 访问
+
+在编译的类型检查期间，hash[key] 以及类似的操作都会被转换成哈希的`OINDEXMAP`操作，赋值语句左侧接受参数的个数会决定使用的运行时方法：
+
+- 当接受一个参数时，会使用 runtime.mapaccess1，该函数仅会返回一个指向目标值的指针；
+- 当接受两个参数时，会使用 runtime.mapaccess2，除了返回目标值之外，它还会返回一个用于表示当前键对应的值是否存在的 bool 值；
+
+```go
+v     := hash[key] // => v     := *mapaccess1(maptype, hash, &key)
+v, ok := hash[key] // => v, ok := mapaccess2(maptype, hash, &key)
+```
+
+runtime.mapaccess1 会先通过哈希表设置的哈希函数、种子获取当前键对应的哈希，再通过 runtime.bucketMask 和 runtime.add 拿到该键值对所在的桶序号和哈希高位的 8 位数字。
+
+```go
+func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	alg := t.key.alg
+	hash := alg.hash(key, uintptr(h.hash0))
+	m := bucketMask(h.B)
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
+	top := tophash(hash)
+bucketloop:
+	for ; b != nil; b = b.overflow(t) {
+		for i := uintptr(0); i < bucketCnt; i++ {
+			if b.tophash[i] != top {
+				if b.tophash[i] == emptyRest {
+					break bucketloop
+				}
+				continue
+			}
+			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+			if alg.equal(key, k) {
+				v := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.valuesize))
+				return v
+			}
+		}
+	}
+	return unsafe.Pointer(&zeroVal[0])
+}
+```
